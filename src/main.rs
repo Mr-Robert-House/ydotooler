@@ -23,11 +23,7 @@ type Term = Terminal<CrosstermBackend<io::Stdout>>;
 // ─── Domain ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
-enum Mode {
-    PressRelease,
-    PressOnly,
-    ReleaseOnly,
-}
+enum Mode { PressRelease, PressOnly, ReleaseOnly }
 
 impl Mode {
     fn as_str(&self) -> &'static str {
@@ -44,43 +40,82 @@ impl Mode {
             _              => Mode::PressRelease,
         }
     }
-    fn all() -> &'static [&'static str] {
-        &["press+release", "press only", "release only"]
-    }
+    fn all() -> &'static [&'static str] { &["press+release", "press only", "release only"] }
 }
 
 #[derive(Debug, Clone)]
 enum EventKind {
-    Key { code: String, name: String, mode: Mode },
-    Delay(String),
+    Key   { code: String, name: String, mode: Mode },
+    Delay (String),
+    Type  (String),
+    LoopStart(u32),   // 0 = infinite
+    LoopEnd,
 }
 
 impl EventKind {
     fn display(&self) -> String {
         match self {
             EventKind::Key { code, name, mode } =>
-                format!("KEY {} ({}) {}", name, code, mode.as_str()),
-            EventKind::Delay(d) =>
-                format!("DELAY {}s", d),
+            format!("KEY {} ({}) {}", name, code, mode.as_str()),
+                EventKind::Delay(d)      => format!("DELAY {}s", d),
+                EventKind::Type(s)       => format!("TYPE \"{}\"", s),
+                EventKind::LoopStart(0)  => "LOOP ∞ (infinite)".to_string(),
+                EventKind::LoopStart(n)  => format!("LOOP {} times", n),
+                EventKind::LoopEnd       => "END LOOP".to_string(),
         }
     }
-    fn bash_lines(&self, auto_delay: &str) -> Vec<String> {
+
+    /// Lines of bash this event produces, given nesting depth for indentation.
+    fn bash_lines(&self, auto_delay: &str, depth: usize) -> Vec<String> {
+        let indent = "  ".repeat(depth);
         let mut out = Vec::new();
         match self {
             EventKind::Key { code, name, mode } => {
-                let line = match mode {
+                let cmd = match mode {
                     Mode::PressOnly    => format!("ydotool key {}:1 #{}", code, name),
                     Mode::ReleaseOnly  => format!("ydotool key {}:0 #{}", code, name),
                     Mode::PressRelease => format!("ydotool key {}:1 {}:0 #{}", code, code, name),
                 };
-                out.push(line);
-                if auto_delay != "0" {
-                    out.push(format!("sleep {}", auto_delay));
-                }
+                out.push(format!("{}{}", indent, cmd));
+                if auto_delay != "0" { out.push(format!("{}sleep {}", indent, auto_delay)); }
             }
-            EventKind::Delay(d) => out.push(format!("sleep {}", d)),
+            EventKind::Delay(d)     => out.push(format!("{}sleep {}", indent, d)),
+            EventKind::Type(s)      => {
+                out.push(format!("{}ydotool type \"{}\"", indent, s));
+                if auto_delay != "0" { out.push(format!("{}sleep {}", indent, auto_delay)); }
+            }
+            EventKind::LoopStart(0) => out.push(format!("{}while true; do", indent)),
+            EventKind::LoopStart(n) => out.push(format!("{}for _i in $(seq {}); do", indent, n)),
+            EventKind::LoopEnd      => out.push(format!("{}done", indent)),
         }
         out
+    }
+
+    fn save_str(&self) -> String {
+        match self {
+            EventKind::Key { code, name, mode } =>
+            format!("KEY|{}|{}|{}", code, name, mode.as_str()),
+                EventKind::Delay(d)     => format!("DELAY|{}||", d),
+                EventKind::Type(s)      => format!("TYPE|{}||", s),
+                EventKind::LoopStart(n) => format!("LOOP_START|{}||", n),
+                EventKind::LoopEnd      => "LOOP_END|||".to_string(),
+        }
+    }
+
+    fn from_saved(parts: &[&str]) -> Option<Self> {
+        match parts[0] {
+            "KEY" if parts.len() == 4 => Some(EventKind::Key {
+                code: parts[1].to_string(),
+                                              name: parts[2].to_string(),
+                                              mode: Mode::from_str(parts[3]),
+            }),
+            "DELAY" if parts.len() >= 2 => Some(EventKind::Delay(parts[1].to_string())),
+            "TYPE"  if parts.len() >= 2 => Some(EventKind::Type(parts[1].to_string())),
+            "LOOP_START" if parts.len() >= 2 =>
+            Some(EventKind::LoopStart(parts[1].parse().unwrap_or(0))),
+            "LOOP_END" => Some(EventKind::LoopEnd),
+            _ => None,
+        }
     }
 }
 
@@ -91,19 +126,19 @@ struct Project {
     project_file: PathBuf,
     output_file: PathBuf,
     auto_delay: String,
+    global_loop: u32,   // 0 = no global loop
     events: Vec<EventKind>,
 }
 
 impl Project {
     fn new(name: &str) -> Self {
-        let base = name
-            .trim_end_matches(".ydotooler")
-            .trim_end_matches(".sh");
+        let base = name.trim_end_matches(".ydotooler").trim_end_matches(".sh");
         Project {
             name: base.to_string(),
             project_file: PathBuf::from(format!("{}.ydotooler", base)),
             output_file: PathBuf::from(format!("{}.sh", base)),
             auto_delay: "0".to_string(),
+            global_loop: 0,
             events: Vec::new(),
         }
     }
@@ -111,8 +146,9 @@ impl Project {
     fn load(&mut self) -> Result<()> {
         self.events.clear();
         self.auto_delay = "0".to_string();
+        self.global_loop = 0;
         if !self.project_file.exists() {
-            fs::write(&self.project_file, "#AUTO_DELAY=0\n")?;
+            fs::write(&self.project_file, "#AUTO_DELAY=0\n#GLOBAL_LOOP=0\n")?;
             return Ok(());
         }
         let f = fs::File::open(&self.project_file)?;
@@ -122,16 +158,14 @@ impl Project {
                 self.auto_delay = line["#AUTO_DELAY=".len()..].to_string();
                 continue;
             }
+            if line.starts_with("#GLOBAL_LOOP=") {
+                self.global_loop = line["#GLOBAL_LOOP=".len()..].parse().unwrap_or(0);
+                continue;
+            }
             let parts: Vec<&str> = line.splitn(4, '|').collect();
             if parts.is_empty() || parts[0].is_empty() { continue; }
-            match parts[0] {
-                "KEY" if parts.len() == 4 => self.events.push(EventKind::Key {
-                    code: parts[1].to_string(),
-                    name: parts[2].to_string(),
-                    mode: Mode::from_str(parts[3]),
-                }),
-                "DELAY" if parts.len() >= 2 => self.events.push(EventKind::Delay(parts[1].to_string())),
-                _ => {}
+            if let Some(ev) = EventKind::from_saved(&parts) {
+                self.events.push(ev);
             }
         }
         Ok(())
@@ -140,14 +174,8 @@ impl Project {
     fn save(&self) -> Result<()> {
         let mut f = fs::File::create(&self.project_file)?;
         writeln!(f, "#AUTO_DELAY={}", self.auto_delay)?;
-        for ev in &self.events {
-            match ev {
-                EventKind::Key { code, name, mode } =>
-                    writeln!(f, "KEY|{}|{}|{}", code, name, mode.as_str())?,
-                EventKind::Delay(d) =>
-                    writeln!(f, "DELAY|{}||", d)?,
-            }
-        }
+        writeln!(f, "#GLOBAL_LOOP={}", self.global_loop)?;
+        for ev in &self.events { writeln!(f, "{}", ev.save_str())?; }
         Ok(())
     }
 
@@ -156,65 +184,68 @@ impl Project {
         writeln!(f, "#!/usr/bin/env bash")?;
         writeln!(f, "# Generated by ydotooler")?;
         writeln!(f)?;
-        for ev in &self.events {
-            for line in ev.bash_lines(&self.auto_delay) {
-                writeln!(f, "{}", line)?;
-            }
+
+        let body = self.render_body(0);
+
+        if self.global_loop > 0 {
+            writeln!(f, "for _i in $(seq {}); do", self.global_loop)?;
+            for line in &body { writeln!(f, "  {}", line)?; }
+            writeln!(f, "done")?;
+        } else {
+            for line in &body { writeln!(f, "{}", line)?; }
         }
+
         #[cfg(unix)] {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&self.output_file)?.permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&self.output_file, perms)?;
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&self.output_file)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&self.output_file, perms)?;
         }
         Ok(self.output_file.clone())
     }
 
     fn bash_preview(&self) -> String {
+        let body = self.render_body(0);
         let mut lines = vec![
             "#!/usr/bin/env bash".to_string(),
             "# Generated by ydotooler".to_string(),
             String::new(),
         ];
-        for ev in &self.events {
-            lines.extend(ev.bash_lines(&self.auto_delay));
+        if self.global_loop > 0 {
+            lines.push(format!("for _i in $(seq {}); do", self.global_loop));
+            for l in body { lines.push(format!("  {}", l)); }
+            lines.push("done".to_string());
+        } else {
+            lines.extend(body);
         }
         lines.join("\n")
+    }
+
+    /// Render events to bash lines, tracking loop depth for indentation.
+    fn render_body(&self, base_depth: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut depth = base_depth;
+        for ev in &self.events {
+            if matches!(ev, EventKind::LoopEnd) && depth > base_depth { depth -= 1; }
+            out.extend(ev.bash_lines(&self.auto_delay, depth));
+            if matches!(ev, EventKind::LoopStart(_)) { depth += 1; }
+        }
+        out
     }
 }
 
 // ─── Terminal helpers ─────────────────────────────────────────────────────────
 
-/// Suspend the TUI, run a plain-terminal closure, then restore and clear.
 fn with_plain_terminal<F, T>(terminal: &mut Term, f: F) -> Result<T>
-where
-    F: FnOnce() -> Result<T>,
-{
+where F: FnOnce() -> Result<T> {
     disable_raw_mode()?;
     execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
-
     let result = f();
-
     enable_raw_mode()?;
     execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-    // Force a full repaint — this is the key fix.
     terminal.clear()?;
-
     result
 }
-
-fn prompt_line(terminal: &mut Term, label: &str) -> Result<Option<String>> {
-    with_plain_terminal(terminal, || {
-        print!("{}", label);
-        io::stdout().flush()?;
-        let mut buf = String::new();
-        io::stdin().read_line(&mut buf)?;
-        let val = buf.trim().to_string();
-        Ok(if val.is_empty() { None } else { Some(val) })
-    })
-}
-
-// ─── In-TUI pickers (reuse the existing terminal, no new Terminal::new) ───────
 
 fn pick_key_code(terminal: &mut Term, codes_path: &Path) -> Result<Option<String>> {
     let content = fs::read_to_string(codes_path)?;
@@ -222,49 +253,42 @@ fn pick_key_code(terminal: &mut Term, codes_path: &Path) -> Result<Option<String
     let mut query = String::new();
     let mut list_state = ListState::default();
     list_state.select(Some(0));
-
-    // Clear before taking over the screen
     terminal.clear()?;
 
     loop {
         let filtered: Vec<&String> = lines.iter()
-            .filter(|l| l.to_lowercase().contains(&query.to_lowercase()))
-            .collect();
+        .filter(|l| l.to_lowercase().contains(&query.to_lowercase()))
+        .collect();
         let sel = list_state.selected().unwrap_or(0).min(filtered.len().saturating_sub(1));
         list_state.select(Some(sel));
 
         terminal.draw(|f| {
             let area = f.size();
             let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(3), Constraint::Min(0)])
-                .split(area);
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(0)])
+            .split(area);
             let search = Paragraph::new(format!(" {}_", query))
-                .block(Block::default().borders(Borders::ALL)
-                    .title(" Search key code (ESC=cancel, Enter=select) ")
-                    .border_style(Style::default().fg(Color::Yellow)));
+            .block(Block::default().borders(Borders::ALL)
+            .title(" Search key code (ESC=cancel, Enter=select) ")
+            .border_style(Style::default().fg(Color::Yellow)));
             f.render_widget(search, chunks[0]);
-            let items: Vec<ListItem> = filtered.iter()
-                .map(|l| ListItem::new(l.as_str())).collect();
+            let items: Vec<ListItem> = filtered.iter().map(|l| ListItem::new(l.as_str())).collect();
             let list = List::new(items)
-                .block(Block::default().borders(Borders::ALL).title(" Key codes "))
-                .highlight_style(Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD))
-                .highlight_symbol("▶ ");
+            .block(Block::default().borders(Borders::ALL).title(" Key codes "))
+            .highlight_style(Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD))
+            .highlight_symbol("▶ ");
             f.render_stateful_widget(list, chunks[1], &mut list_state);
         })?;
 
         if let Event::Key(key) = event::read()? {
             match key.code {
-                KeyCode::Esc     => { terminal.clear()?; return Ok(None); }
-                KeyCode::Enter   => {
-                    let chosen = filtered.get(sel).map(|s| s.to_string());
-                    terminal.clear()?;
-                    return Ok(chosen);
-                }
-                KeyCode::Char(c) => { query.push(c); list_state.select(Some(0)); }
+                KeyCode::Esc       => { terminal.clear()?; return Ok(None); }
+                KeyCode::Enter     => { let r = filtered.get(sel).map(|s| s.to_string()); terminal.clear()?; return Ok(r); }
+                KeyCode::Char(c)   => { query.push(c); list_state.select(Some(0)); }
                 KeyCode::Backspace => { query.pop(); list_state.select(Some(0)); }
-                KeyCode::Down    => { let n = (sel + 1).min(filtered.len().saturating_sub(1)); list_state.select(Some(n)); }
-                KeyCode::Up      => { list_state.select(Some(sel.saturating_sub(1))); }
+                KeyCode::Down      => { let n = (sel+1).min(filtered.len().saturating_sub(1)); list_state.select(Some(n)); }
+                KeyCode::Up        => { list_state.select(Some(sel.saturating_sub(1))); }
                 _ => {}
             }
         }
@@ -274,7 +298,6 @@ fn pick_key_code(terminal: &mut Term, codes_path: &Path) -> Result<Option<String
 fn pick_from_list(terminal: &mut Term, title: &str, options: &[&str]) -> Result<Option<String>> {
     let mut list_state = ListState::default();
     list_state.select(Some(0));
-
     terminal.clear()?;
 
     loop {
@@ -283,11 +306,11 @@ fn pick_from_list(terminal: &mut Term, title: &str, options: &[&str]) -> Result<
             let area = centered_rect(40, options.len() as u16 + 4, f.size());
             let items: Vec<ListItem> = options.iter().map(|o| ListItem::new(*o)).collect();
             let list = List::new(items)
-                .block(Block::default().borders(Borders::ALL)
-                    .title(format!(" {} (ESC=cancel) ", title))
-                    .border_style(Style::default().fg(Color::Yellow)))
-                .highlight_style(Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD))
-                .highlight_symbol("▶ ");
+            .block(Block::default().borders(Borders::ALL)
+            .title(format!(" {} (ESC=cancel) ", title))
+            .border_style(Style::default().fg(Color::Yellow)))
+            .highlight_style(Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD))
+            .highlight_symbol("▶ ");
             f.render_stateful_widget(list, area, &mut list_state);
         })?;
 
@@ -295,7 +318,7 @@ fn pick_from_list(terminal: &mut Term, title: &str, options: &[&str]) -> Result<
             match key.code {
                 KeyCode::Esc   => { terminal.clear()?; return Ok(None); }
                 KeyCode::Enter => { terminal.clear()?; return Ok(Some(options[sel].to_string())); }
-                KeyCode::Down  => list_state.select(Some((sel + 1).min(options.len() - 1))),
+                KeyCode::Down  => list_state.select(Some((sel+1).min(options.len()-1))),
                 KeyCode::Up    => list_state.select(Some(sel.saturating_sub(1))),
                 _ => {}
             }
@@ -305,67 +328,105 @@ fn pick_from_list(terminal: &mut Term, title: &str, options: &[&str]) -> Result<
 
 fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
     let vert = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100u16.saturating_sub(height.min(100))) / 2),
-            Constraint::Length(height),
-            Constraint::Min(0),
-        ])
-        .split(area);
+    .direction(Direction::Vertical)
+    .constraints([
+        Constraint::Percentage((100u16.saturating_sub(height.min(100))) / 2),
+                 Constraint::Length(height),
+                 Constraint::Min(0),
+    ])
+    .split(area);
     Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(vert[1])[1]
+    .direction(Direction::Horizontal)
+    .constraints([
+        Constraint::Percentage((100 - percent_x) / 2),
+                 Constraint::Percentage(percent_x),
+                 Constraint::Percentage((100 - percent_x) / 2),
+    ])
+    .split(vert[1])[1]
 }
 
 // ─── App state ────────────────────────────────────────────────────────────────
 
 const MENU: &[&str] = &[
     "Add key",
-    "Add delay",
-    "Move up",
-    "Move down",
-    "Edit event",
-    "Delete event",
-    "Set auto delay",
-    "Save",
-    "Load",
-    "Generate",
-    "Quit",
+"Add delay",
+"Add type",
+"Add loop block",
+"Move up",
+"Move down",
+"Edit event",
+"Delete event",
+"Set auto delay",
+"Set global loop",
+"Save",
+"Load",
+"Generate",
+"Quit",
 ];
 
 #[derive(PartialEq)]
 enum Focus { Menu, Events }
 
+/// What the status bar is doing right now.
+enum InputMode {
+    Normal,
+    /// Inline prompt: label shown, buffer being edited, and what to do on confirm.
+    Prompting {
+        label: String,
+        buffer: String,
+        target: PromptTarget,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PromptTarget {
+    AddDelay,
+    AddType,
+    EditDelay(usize),
+    EditType(usize),
+    EditLoopCount(usize),
+    SetAutoDelay,
+    SetGlobalLoop,
+    AddLoopBlock,   // reuse buffer as loop count for a new loop pair
+}
+
 struct App {
     project: Project,
     menu_state: ListState,
     event_state: ListState,
-    status: String,
+    /// Which event indices are multi-selected.
+    selected: Vec<bool>,
     focus: Focus,
+    input_mode: InputMode,
+    status: String,
 }
 
 impl App {
     fn new(project: Project) -> Self {
+        let len = project.events.len();
         let mut menu_state = ListState::default();
         menu_state.select(Some(0));
         let mut event_state = ListState::default();
-        if !project.events.is_empty() { event_state.select(Some(0)); }
+        if len > 0 { event_state.select(Some(0)); }
         App {
             project,
             menu_state,
             event_state,
-            status: "Ready — Tab to switch pane".to_string(),
+            selected: vec![false; len],
             focus: Focus::Menu,
+            input_mode: InputMode::Normal,
+            status: "Ready — Tab to switch pane".to_string(),
         }
     }
+
     fn menu_sel(&self) -> usize { self.menu_state.selected().unwrap_or(0) }
-    fn event_sel(&self) -> Option<usize> { self.event_state.selected() }
-    fn clamp_event_sel(&mut self) {
+    fn cursor(&self) -> Option<usize> { self.event_state.selected() }
+
+    fn sync_selected_len(&mut self) {
+        self.selected.resize(self.project.events.len(), false);
+    }
+
+    fn clamp_cursor(&mut self) {
         let len = self.project.events.len();
         if len == 0 {
             self.event_state.select(None);
@@ -373,6 +434,36 @@ impl App {
             let cur = self.event_state.selected().unwrap_or(0).min(len - 1);
             self.event_state.select(Some(cur));
         }
+        self.sync_selected_len();
+    }
+
+    fn clear_selection(&mut self) {
+        self.selected.iter_mut().for_each(|s| *s = false);
+    }
+
+    /// Indices that are part of the effective move set:
+    /// if anything is multi-selected, use those; otherwise use the cursor.
+    fn effective_selection(&self) -> Vec<usize> {
+        let multi: Vec<usize> = self.selected.iter().enumerate()
+        .filter_map(|(i, &s)| if s { Some(i) } else { None })
+        .collect();
+        if !multi.is_empty() {
+            multi
+        } else if let Some(c) = self.cursor() {
+            vec![c]
+        } else {
+            vec![]
+        }
+    }
+
+    fn is_prompting(&self) -> bool { matches!(self.input_mode, InputMode::Prompting { .. }) }
+
+    fn start_prompt(&mut self, label: &str, target: PromptTarget) {
+        self.input_mode = InputMode::Prompting {
+            label: label.to_string(),
+            buffer: String::new(),
+            target,
+        };
     }
 }
 
@@ -380,14 +471,14 @@ impl App {
 
 fn draw(f: &mut Frame, app: &mut App) {
     let root = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
-        .split(f.size());
+    .direction(Direction::Vertical)
+    .constraints([Constraint::Min(0), Constraint::Length(1)])
+    .split(f.size());
 
     let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(22), Constraint::Percentage(35), Constraint::Min(0)])
-        .split(root[0]);
+    .direction(Direction::Horizontal)
+    .constraints([Constraint::Length(22), Constraint::Percentage(35), Constraint::Min(0)])
+    .split(root[0]);
 
     draw_menu(f, app, body[0]);
     draw_events(f, app, body[1]);
@@ -396,62 +487,117 @@ fn draw(f: &mut Frame, app: &mut App) {
 }
 
 fn draw_menu(f: &mut Frame, app: &mut App, area: Rect) {
-    let focused = app.focus == Focus::Menu;
+    let focused = app.focus == Focus::Menu && !app.is_prompting();
     let border_style = if focused { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
     let items: Vec<ListItem> = MENU.iter().map(|m| ListItem::new(*m)).collect();
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL)
-            .title(Span::styled(" Menu ", Style::default().add_modifier(Modifier::BOLD)))
-            .border_style(border_style))
-        .highlight_style(Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD))
-        .highlight_symbol("▶ ");
+    .block(Block::default().borders(Borders::ALL)
+    .title(Span::styled(" Menu ", Style::default().add_modifier(Modifier::BOLD)))
+    .border_style(border_style))
+    .highlight_style(Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD))
+    .highlight_symbol("▶ ");
     f.render_stateful_widget(list, area, &mut app.menu_state);
 }
 
 fn draw_events(f: &mut Frame, app: &mut App, area: Rect) {
-    let focused = app.focus == Focus::Events;
+    let focused = app.focus == Focus::Events && !app.is_prompting();
     let border_style = if focused { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) };
+
+    // Compute loop depth per event for indentation display
+    let depths = compute_depths(&app.project.events);
+
     let items: Vec<ListItem> = app.project.events.iter().enumerate()
-        .map(|(i, ev)| {
-            let (icon, color) = match ev {
-                EventKind::Key { .. } => ("⌨ ", Color::Green),
-                EventKind::Delay(_)   => ("⏱ ", Color::Magenta),
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{:>3} ", i), Style::default().fg(Color::DarkGray)),
-                Span::styled(icon, Style::default().fg(color)),
-                Span::raw(ev.display()),
-            ]))
-        })
-        .collect();
-    let title = format!(" Events ({}) ", app.project.events.len());
+    .map(|(i, ev)| {
+        let is_sel = app.selected.get(i).copied().unwrap_or(false);
+        let depth = depths.get(i).copied().unwrap_or(0);
+        let indent = "  ".repeat(depth);
+
+        let (icon, color) = match ev {
+            EventKind::Key { .. }       => ("⌨ ", Color::Green),
+         EventKind::Delay(_)         => ("⏱ ", Color::Magenta),
+         EventKind::Type(_)          => ("T ", Color::Cyan),
+         EventKind::LoopStart(_)     => ("↩ ", Color::Yellow),
+         EventKind::LoopEnd          => ("↪ ", Color::Yellow),
+        };
+
+        let sel_marker = if is_sel {
+            Span::styled("● ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+        } else {
+            Span::styled("  ", Style::default())
+        };
+
+        ListItem::new(Line::from(vec![
+            sel_marker,
+            Span::styled(format!("{:>3} ", i), Style::default().fg(Color::DarkGray)),
+                                 Span::raw(indent),
+                                 Span::styled(icon, Style::default().fg(color)),
+                                 Span::raw(ev.display()),
+        ]))
+    })
+    .collect();
+
+    let multi_count = app.selected.iter().filter(|&&s| s).count();
+    let title = if multi_count > 0 {
+        format!(" Events ({}) [{} selected] ", app.project.events.len(), multi_count)
+    } else {
+        format!(" Events ({}) ", app.project.events.len())
+    };
+
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL)
-            .title(Span::styled(title, Style::default().add_modifier(Modifier::BOLD)))
-            .border_style(border_style))
-        .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD))
-        .highlight_symbol("▶ ");
+    .block(Block::default().borders(Borders::ALL)
+    .title(Span::styled(title, Style::default().add_modifier(Modifier::BOLD)))
+    .border_style(border_style))
+    .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD))
+    .highlight_symbol("▶ ");
     f.render_stateful_widget(list, area, &mut app.event_state);
+}
+
+/// Returns the display indent depth for each event.
+fn compute_depths(events: &[EventKind]) -> Vec<usize> {
+    let mut depths = Vec::with_capacity(events.len());
+    let mut depth: usize = 0;
+    for ev in events {
+        if matches!(ev, EventKind::LoopEnd) { depth = depth.saturating_sub(1); }
+        depths.push(depth);
+        if matches!(ev, EventKind::LoopStart(_)) { depth += 1; }
+    }
+    depths
 }
 
 fn draw_bash_preview(f: &mut Frame, app: &mut App, area: Rect) {
     let preview = app.project.bash_preview();
     let lines: Vec<Line> = preview.lines().map(|line| {
-        if line.starts_with('#') {
+        let trimmed = line.trim_start();
+        let leading = &line[..line.len() - trimmed.len()];
+        if trimmed.starts_with('#') {
             Line::from(Span::styled(line.to_string(), Style::default().fg(Color::DarkGray)))
-        } else if line.starts_with("ydotool") {
-            let (cmd, rest) = line.split_once(' ').unwrap_or((line, ""));
+        } else if trimmed.starts_with("ydotool type") {
+            let rest = trimmed["ydotool type".len()..].to_string();
             Line::from(vec![
-                Span::styled(format!("{} ", cmd), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Span::styled(rest.to_string(), Style::default().fg(Color::Green)),
+                Span::raw(leading.to_string()),
+                       Span::styled("ydotool ".to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                       Span::styled("type ".to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                       Span::styled(rest, Style::default().fg(Color::White)),
             ])
-        } else if line.starts_with("sleep") {
-            let (cmd, rest) = line.split_once(' ').unwrap_or((line, ""));
+        } else if trimmed.starts_with("ydotool") {
+            let (cmd, rest) = trimmed.split_once(' ').unwrap_or((trimmed, ""));
             Line::from(vec![
-                Span::styled(format!("{} ", cmd), Style::default().fg(Color::Magenta)),
-                Span::styled(rest.to_string(), Style::default().fg(Color::White)),
+                Span::raw(leading.to_string()),
+                       Span::styled(format!("{} ", cmd), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                       Span::styled(rest.to_string(), Style::default().fg(Color::Green)),
             ])
-        } else if line.starts_with("#!/") {
+        } else if trimmed.starts_with("sleep") {
+            let (cmd, rest) = trimmed.split_once(' ').unwrap_or((trimmed, ""));
+            Line::from(vec![
+                Span::raw(leading.to_string()),
+                       Span::styled(format!("{} ", cmd), Style::default().fg(Color::Magenta)),
+                       Span::styled(rest.to_string(), Style::default().fg(Color::White)),
+            ])
+        } else if trimmed.starts_with("for ") || trimmed.starts_with("while ") {
+            Line::from(Span::styled(line.to_string(), Style::default().fg(Color::Yellow)))
+        } else if trimmed == "done" {
+            Line::from(Span::styled(line.to_string(), Style::default().fg(Color::Yellow)))
+        } else if trimmed.starts_with("#!/") {
             Line::from(Span::styled(line.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
         } else {
             Line::from(Span::raw(line.to_string()))
@@ -459,28 +605,144 @@ fn draw_bash_preview(f: &mut Frame, app: &mut App, area: Rect) {
     }).collect();
 
     let para = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL)
-            .title(Span::styled(
-                format!(" Bash Preview → {} ", app.project.output_file.display()),
-                Style::default().add_modifier(Modifier::BOLD),
-            ))
-            .border_style(Style::default().fg(Color::DarkGray)))
-        .wrap(Wrap { trim: false });
+    .block(Block::default().borders(Borders::ALL)
+    .title(Span::styled(
+        format!(" Bash Preview → {} ", app.project.output_file.display()),
+            Style::default().add_modifier(Modifier::BOLD),
+    ))
+    .border_style(Style::default().fg(Color::DarkGray)))
+    .wrap(Wrap { trim: false });
     f.render_widget(para, area);
 }
 
 fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
-    let help = match app.focus {
-        Focus::Menu   => "↑↓ navigate  Enter select  Tab→Events  q quit",
-        Focus::Events => "↑↓ navigate  d delete  k up  j down  Tab→Menu",
-    };
-    let text = format!(
-        " {} │ auto_delay={} │ {}  │  {}",
-        app.project.name, app.project.auto_delay, help, app.status,
-    );
-    let para = Paragraph::new(text)
-        .style(Style::default().bg(Color::DarkGray).fg(Color::White));
-    f.render_widget(para, area);
+    match &app.input_mode {
+        InputMode::Prompting { label, buffer, .. } => {
+            let text = format!(" {} {}_", label, buffer);
+            let para = Paragraph::new(text)
+            .style(Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD));
+            f.render_widget(para, area);
+        }
+        InputMode::Normal => {
+            let help = match app.focus {
+                Focus::Menu   => "↑↓ navigate  Enter select  Tab→Events  q quit",
+                Focus::Events => "↑↓ navigate  Space=toggle-sel  k/K up  j/J down  d delete  Tab→Menu",
+            };
+            let global = if app.project.global_loop > 0 {
+                format!("global_loop={}x", app.project.global_loop)
+            } else {
+                "global_loop=off".to_string()
+            };
+            let text = format!(
+                " {} │ auto_delay={} │ {} │ {}  │  {}",
+                app.project.name, app.project.auto_delay, global, help, app.status,
+            );
+            let para = Paragraph::new(text)
+            .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+            f.render_widget(para, area);
+        }
+    }
+}
+
+// ─── Multi-select move helpers ────────────────────────────────────────────────
+
+/// Move a set of indices up by one position. Indices must be sorted ascending.
+fn move_indices_up(events: &mut Vec<EventKind>, selected: &mut Vec<bool>, indices: &[usize]) {
+    if indices.is_empty() || indices[0] == 0 { return; }
+    for &i in indices {
+        events.swap(i - 1, i);
+        selected.swap(i - 1, i);
+    }
+}
+
+/// Move a set of indices down by one position. Indices must be sorted ascending.
+fn move_indices_down(events: &mut Vec<EventKind>, selected: &mut Vec<bool>, indices: &[usize]) {
+    let len = events.len();
+    if indices.is_empty() || *indices.last().unwrap() + 1 >= len { return; }
+    for &i in indices.iter().rev() {
+        events.swap(i, i + 1);
+        selected.swap(i, i + 1);
+    }
+}
+
+// ─── Inline prompt confirm ────────────────────────────────────────────────────
+
+fn confirm_prompt(app: &mut App) {
+    // Swap out the input mode to inspect it
+    let mode = std::mem::replace(&mut app.input_mode, InputMode::Normal);
+    if let InputMode::Prompting { buffer, target, .. } = mode {
+        let val = buffer.trim().to_string();
+        match target {
+            PromptTarget::AddDelay => {
+                if !val.is_empty() {
+                    app.project.events.push(EventKind::Delay(val.clone()));
+                    app.clamp_cursor();
+                    app.status = format!("Delay {}s added.", val);
+                }
+            }
+            PromptTarget::AddType => {
+                if !val.is_empty() {
+                    app.project.events.push(EventKind::Type(val.clone()));
+                    app.clamp_cursor();
+                    app.status = format!("Type event added.");
+                }
+            }
+            PromptTarget::EditDelay(idx) => {
+                if !val.is_empty() {
+                    app.project.events[idx] = EventKind::Delay(val.clone());
+                    app.status = format!("Delay updated to {}s.", val);
+                }
+            }
+            PromptTarget::EditType(idx) => {
+                if !val.is_empty() {
+                    app.project.events[idx] = EventKind::Type(val.clone());
+                    app.status = "Type text updated.".to_string();
+                }
+            }
+            PromptTarget::EditLoopCount(idx) => {
+                if let Ok(n) = val.parse::<u32>() {
+                    app.project.events[idx] = EventKind::LoopStart(n);
+                    app.status = format!("Loop count updated to {}.", if n == 0 { "∞".to_string() } else { n.to_string() });
+                } else if !val.is_empty() {
+                    app.status = "Invalid number.".to_string();
+                }
+            }
+            PromptTarget::SetAutoDelay => {
+                if !val.is_empty() {
+                    app.project.auto_delay = val.clone();
+                    app.status = format!("Auto delay set to {}.", val);
+                }
+            }
+            PromptTarget::SetGlobalLoop => {
+                match val.parse::<u32>() {
+                    Ok(n) => {
+                        app.project.global_loop = n;
+                        app.status = if n == 0 {
+                            "Global loop disabled.".to_string()
+                        } else {
+                            format!("Global loop set to {} iteration(s).", n)
+                        };
+                    }
+                    Err(_) if !val.is_empty() => { app.status = "Invalid number.".to_string(); }
+                    _ => {}
+                }
+            }
+            PromptTarget::AddLoopBlock => {
+                let count = val.parse::<u32>().unwrap_or(0);
+                app.project.events.push(EventKind::LoopStart(count));
+                app.project.events.push(EventKind::LoopEnd);
+                app.clamp_cursor();
+                app.status = format!(
+                    "Loop block added ({}). Add events between LOOP and END LOOP.",
+                                     if count == 0 { "∞".to_string() } else { format!("{}x", count) }
+                );
+            }
+        }
+        // Auto-save after any mutation
+        if let Err(e) = app.project.save() {
+            app.status = format!("Auto-save error: {e}");
+        }
+    }
 }
 
 // ─── Actions ─────────────────────────────────────────────────────────────────
@@ -489,36 +751,27 @@ fn action_add_key(terminal: &mut Term, app: &mut App) -> Result<()> {
     let candidates = [
         PathBuf::from("input-event-codes_edited"),
         std::env::current_exe().unwrap_or_default()
-            .parent().unwrap_or(Path::new("."))
-            .join("input-event-codes_edited"),
+        .parent().unwrap_or(Path::new("."))
+        .join("input-event-codes_edited"),
     ];
     let codes_path = candidates.iter().find(|p| p.exists()).cloned()
-        .context("input-event-codes_edited not found next to binary or in cwd")?;
+    .context("input-event-codes_edited not found next to binary or in cwd")?;
 
     let sel = match pick_key_code(terminal, &codes_path)? { Some(s) => s, None => return Ok(()) };
     let (code, name) = if let Some(pos) = sel.find(':') {
-        (sel[..pos].trim().to_string(), sel[pos + 1..].trim().to_string())
+        (sel[..pos].trim().to_string(), sel[pos+1..].trim().to_string())
     } else {
         (sel.trim().to_string(), sel.trim().to_string())
     };
     let mode_str = match pick_from_list(terminal, "Key mode", Mode::all())? { Some(s) => s, None => return Ok(()) };
     app.project.events.push(EventKind::Key { code, name, mode: Mode::from_str(&mode_str) });
-    app.clamp_event_sel();
+    app.clamp_cursor();
     app.status = "Key added.".to_string();
     Ok(())
 }
 
-fn action_add_delay(terminal: &mut Term, app: &mut App) -> Result<()> {
-    if let Some(d) = prompt_line(terminal, "Delay (seconds, e.g. 0.5): ")? {
-        app.project.events.push(EventKind::Delay(d));
-        app.clamp_event_sel();
-        app.status = "Delay added.".to_string();
-    }
-    Ok(())
-}
-
 fn action_edit(terminal: &mut Term, app: &mut App) -> Result<()> {
-    let idx = match app.event_sel() {
+    let idx = match app.cursor() {
         Some(i) => i,
         None => { app.status = "No event selected.".to_string(); return Ok(()); }
     };
@@ -529,51 +782,48 @@ fn action_edit(terminal: &mut Term, app: &mut App) -> Result<()> {
                     *mode = Mode::from_str(&mode_str);
                 }
                 app.status = "Mode updated.".to_string();
+                app.project.save()?;
             }
         }
-        EventKind::Delay(_) => {
-            if let Some(d) = prompt_line(terminal, "New delay (seconds): ")? {
-                app.project.events[idx] = EventKind::Delay(d);
-                app.status = "Delay updated.".to_string();
-            }
+        EventKind::Delay(d) => {
+            let current = d.clone();
+            app.start_prompt(&format!("Edit delay [{}s] → ", current), PromptTarget::EditDelay(idx));
+        }
+        EventKind::Type(s) => {
+            let current = s.clone();
+            app.start_prompt(&format!("Edit type text [{}] → ", current), PromptTarget::EditType(idx));
+        }
+        EventKind::LoopStart(n) => {
+            let current = *n;
+            app.start_prompt(
+                &format!("Loop count (0=∞) [{}] → ", current),
+                             PromptTarget::EditLoopCount(idx),
+            );
+        }
+        EventKind::LoopEnd => {
+            app.status = "END LOOP has no editable fields.".to_string();
         }
     }
     Ok(())
 }
 
 fn action_delete(app: &mut App) {
-    match app.event_sel() {
-        Some(idx) => { app.project.events.remove(idx); app.clamp_event_sel(); app.status = "Event deleted.".to_string(); }
-        None => { app.status = "No event selected.".to_string(); }
+    // Delete all multi-selected, or cursor if none selected
+    let to_delete: Vec<usize> = {
+        let multi: Vec<usize> = app.selected.iter().enumerate()
+        .filter_map(|(i, &s)| if s { Some(i) } else { None })
+        .collect();
+        if !multi.is_empty() { multi }
+        else if let Some(c) = app.cursor() { vec![c] }
+        else { return; }
+    };
+    // Remove in reverse order to preserve indices
+    for &i in to_delete.iter().rev() {
+        app.project.events.remove(i);
     }
-}
-
-fn action_move_up(app: &mut App) {
-    if let Some(idx) = app.event_sel() {
-        if idx > 0 {
-            app.project.events.swap(idx, idx - 1);
-            app.event_state.select(Some(idx - 1));
-            app.status = "Moved up.".to_string();
-        }
-    }
-}
-
-fn action_move_down(app: &mut App) {
-    if let Some(idx) = app.event_sel() {
-        if idx + 1 < app.project.events.len() {
-            app.project.events.swap(idx, idx + 1);
-            app.event_state.select(Some(idx + 1));
-            app.status = "Moved down.".to_string();
-        }
-    }
-}
-
-fn action_set_auto_delay(terminal: &mut Term, app: &mut App) -> Result<()> {
-    if let Some(d) = prompt_line(terminal, "Auto delay (0 for off): ")? {
-        app.project.auto_delay = d;
-        app.status = "Auto delay updated.".to_string();
-    }
-    Ok(())
+    app.clear_selection();
+    app.clamp_cursor();
+    app.status = format!("Deleted {} event(s).", to_delete.len());
 }
 
 fn action_generate(app: &mut App) -> Result<()> {
@@ -623,6 +873,31 @@ fn run_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 return Err(anyhow::anyhow!("quit"));
             }
+
+            // ── Inline prompt mode intercepts all keys ──────────────────────
+            if app.is_prompting() {
+                match key.code {
+                    KeyCode::Enter => confirm_prompt(app),
+                    KeyCode::Esc   => {
+                        app.input_mode = InputMode::Normal;
+                        app.status = "Cancelled.".to_string();
+                    }
+                    KeyCode::Backspace => {
+                        if let InputMode::Prompting { buffer, .. } = &mut app.input_mode {
+                            buffer.pop();
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        if let InputMode::Prompting { buffer, .. } = &mut app.input_mode {
+                            buffer.push(c);
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            // ── Normal mode ─────────────────────────────────────────────────
             if key.code == KeyCode::Tab {
                 app.focus = match app.focus { Focus::Menu => Focus::Events, Focus::Events => Focus::Menu };
                 continue;
@@ -638,31 +913,43 @@ fn run_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
 fn handle_menu_key(terminal: &mut Term, app: &mut App, code: KeyCode) -> Result<()> {
     match code {
         KeyCode::Up   => { let c = app.menu_sel(); app.menu_state.select(Some(c.saturating_sub(1))); }
-        KeyCode::Down => { let c = app.menu_sel(); app.menu_state.select(Some((c + 1).min(MENU.len() - 1))); }
+        KeyCode::Down => { let c = app.menu_sel(); app.menu_state.select(Some((c+1).min(MENU.len()-1))); }
         KeyCode::Char('q') => return Err(anyhow::anyhow!("quit")),
         KeyCode::Enter => {
-            let mutating = matches!(MENU[app.menu_sel()],
-                "Add key" | "Add delay" | "Move up" | "Move down" |
-                "Edit event" | "Delete event" | "Set auto delay");
-
             match MENU[app.menu_sel()] {
                 "Add key"        => action_add_key(terminal, app)?,
-                "Add delay"      => action_add_delay(terminal, app)?,
-                "Move up"        => action_move_up(app),
-                "Move down"      => action_move_down(app),
+                "Add delay"      => app.start_prompt("Delay (seconds, e.g. 0.5) → ", PromptTarget::AddDelay),
+                "Add type"       => app.start_prompt("Type text → ", PromptTarget::AddType),
+                "Add loop block" => app.start_prompt("Loop count (0=∞) → ", PromptTarget::AddLoopBlock),
+                "Move up"        => {
+                    let sel = app.effective_selection();
+                    move_indices_up(&mut app.project.events, &mut app.selected, &sel);
+                    if let Some(&first) = sel.first() {
+                        app.event_state.select(Some(first.saturating_sub(1)));
+                    }
+                    if let Err(e) = app.project.save() { app.status = format!("Save error: {e}"); }
+                }
+                "Move down"      => {
+                    let sel = app.effective_selection();
+                    move_indices_down(&mut app.project.events, &mut app.selected, &sel);
+                    if let Some(&last) = sel.last() {
+                        let new = (last + 1).min(app.project.events.len() - 1);
+                        app.event_state.select(Some(new));
+                    }
+                    if let Err(e) = app.project.save() { app.status = format!("Save error: {e}"); }
+                }
                 "Edit event"     => action_edit(terminal, app)?,
-                "Delete event"   => action_delete(app),
-                "Set auto delay" => action_set_auto_delay(terminal, app)?,
+                "Delete event"   => {
+                    action_delete(app);
+                    if let Err(e) = app.project.save() { app.status = format!("Save error: {e}"); }
+                }
+                "Set auto delay" => app.start_prompt("Auto delay (0=off, e.g. 0.1) → ", PromptTarget::SetAutoDelay),
+                "Set global loop"=> app.start_prompt("Global loop count (0=off, e.g. 5) → ", PromptTarget::SetGlobalLoop),
                 "Save"           => { app.project.save()?; app.status = "Saved.".to_string(); }
-                "Load"           => { app.project.load()?; app.clamp_event_sel(); app.status = "Loaded.".to_string(); }
+                "Load"           => { app.project.load()?; app.clamp_cursor(); app.status = "Loaded.".to_string(); }
                 "Generate"       => action_generate(app)?,
                 "Quit"           => return Err(anyhow::anyhow!("quit")),
                 _ => {}
-            }
-            if mutating {
-                if let Err(e) = app.project.save() {
-                    app.status = format!("Auto-save error: {e}");
-                }
             }
         }
         _ => {}
@@ -673,13 +960,44 @@ fn handle_menu_key(terminal: &mut Term, app: &mut App, code: KeyCode) -> Result<
 fn handle_event_pane_key(app: &mut App, code: KeyCode) {
     let len = app.project.events.len();
     if len == 0 { return; }
-    let sel = app.event_state.selected().unwrap_or(0);
+    let cur = app.event_state.selected().unwrap_or(0);
+
     match code {
-        KeyCode::Up        => { app.event_state.select(Some(sel.saturating_sub(1))); }
-        KeyCode::Down      => { app.event_state.select(Some((sel + 1).min(len - 1))); }
-        KeyCode::Char('d') => action_delete(app),
-        KeyCode::Char('k') => action_move_up(app),
-        KeyCode::Char('j') => action_move_down(app),
+        KeyCode::Up   => { app.event_state.select(Some(cur.saturating_sub(1))); }
+        KeyCode::Down => { app.event_state.select(Some((cur+1).min(len-1))); }
+
+        // Space = toggle multi-select on cursor
+        KeyCode::Char(' ') => {
+            app.sync_selected_len();
+            app.selected[cur] = !app.selected[cur];
+            // Advance cursor after toggle
+            app.event_state.select(Some((cur+1).min(len-1)));
+        }
+
+        // k/j = move cursor item (or selection) up/down
+        KeyCode::Char('k') => {
+            let sel = app.effective_selection();
+            move_indices_up(&mut app.project.events, &mut app.selected, &sel);
+            if let Some(&first) = sel.first() { app.event_state.select(Some(first.saturating_sub(1))); }
+            let _ = app.project.save();
+        }
+        KeyCode::Char('j') => {
+            let sel = app.effective_selection();
+            move_indices_down(&mut app.project.events, &mut app.selected, &sel);
+            if let Some(&last) = sel.last() {
+                let new = (last+1).min(app.project.events.len()-1);
+                app.event_state.select(Some(new));
+            }
+            let _ = app.project.save();
+        }
+
+        // Escape = clear multi-selection
+        KeyCode::Esc => { app.clear_selection(); app.status = "Selection cleared.".to_string(); }
+
+        KeyCode::Char('d') => {
+            action_delete(app);
+            let _ = app.project.save();
+        }
         _ => {}
     }
 }
