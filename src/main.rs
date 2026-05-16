@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
     execute,
@@ -6,7 +6,7 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
@@ -46,6 +46,7 @@ impl Mode {
 #[derive(Debug, Clone)]
 enum EventKind {
     Key   { code: String, name: String, mode: Mode },
+    Click { code: String, name: String, mode: Mode },  // mouse button via ydotool key
     Delay (String),
     Type  (String),
     LoopStart(u32),   // 0 = infinite
@@ -56,12 +57,14 @@ impl EventKind {
     fn display(&self) -> String {
         match self {
             EventKind::Key { code, name, mode } =>
-            format!("KEY {} ({}) {}", name, code, mode.as_str()),
-                EventKind::Delay(d)      => format!("DELAY {}s", d),
-                EventKind::Type(s)       => format!("TYPE \"{}\"", s),
-                EventKind::LoopStart(0)  => "LOOP ∞ (infinite)".to_string(),
-                EventKind::LoopStart(n)  => format!("LOOP {} times", n),
-                EventKind::LoopEnd       => "END LOOP".to_string(),
+                format!("KEY {} ({}) {}", name, code, mode.as_str()),
+            EventKind::Click { code, name, mode } =>
+                format!("CLICK {} ({}) {}", name, code, mode.as_str()),
+            EventKind::Delay(d)      => format!("DELAY {}s", d),
+            EventKind::Type(s)       => format!("TYPE \"{}\"", s),
+            EventKind::LoopStart(0)  => "LOOP ∞ (infinite)".to_string(),
+            EventKind::LoopStart(n)  => format!("LOOP {} times", n),
+            EventKind::LoopEnd       => "END LOOP".to_string(),
         }
     }
 
@@ -71,6 +74,15 @@ impl EventKind {
         let mut out = Vec::new();
         match self {
             EventKind::Key { code, name, mode } => {
+                let cmd = match mode {
+                    Mode::PressOnly    => format!("ydotool key {}:1 #{}", code, name),
+                    Mode::ReleaseOnly  => format!("ydotool key {}:0 #{}", code, name),
+                    Mode::PressRelease => format!("ydotool key {}:1 {}:0 #{}", code, code, name),
+                };
+                out.push(format!("{}{}", indent, cmd));
+                if auto_delay != "0" { out.push(format!("{}sleep {}", indent, auto_delay)); }
+            }
+            EventKind::Click { code, name, mode } => {
                 let cmd = match mode {
                     Mode::PressOnly    => format!("ydotool key {}:1 #{}", code, name),
                     Mode::ReleaseOnly  => format!("ydotool key {}:0 #{}", code, name),
@@ -94,11 +106,13 @@ impl EventKind {
     fn save_str(&self) -> String {
         match self {
             EventKind::Key { code, name, mode } =>
-            format!("KEY|{}|{}|{}", code, name, mode.as_str()),
-                EventKind::Delay(d)     => format!("DELAY|{}||", d),
-                EventKind::Type(s)      => format!("TYPE|{}||", s),
-                EventKind::LoopStart(n) => format!("LOOP_START|{}||", n),
-                EventKind::LoopEnd      => "LOOP_END|||".to_string(),
+                format!("KEY|{}|{}|{}", code, name, mode.as_str()),
+            EventKind::Click { code, name, mode } =>
+                format!("CLICK|{}|{}|{}", code, name, mode.as_str()),
+            EventKind::Delay(d)     => format!("DELAY|{}||", d),
+            EventKind::Type(s)      => format!("TYPE|{}||", s),
+            EventKind::LoopStart(n) => format!("LOOP_START|{}||", n),
+            EventKind::LoopEnd      => "LOOP_END|||".to_string(),
         }
     }
 
@@ -106,13 +120,18 @@ impl EventKind {
         match parts[0] {
             "KEY" if parts.len() == 4 => Some(EventKind::Key {
                 code: parts[1].to_string(),
-                                              name: parts[2].to_string(),
-                                              mode: Mode::from_str(parts[3]),
+                name: parts[2].to_string(),
+                mode: Mode::from_str(parts[3]),
+            }),
+            "CLICK" if parts.len() >= 3 => Some(EventKind::Click {
+                code: parts[1].to_string(),
+                name: parts[2].to_string(),
+                mode: if parts.len() >= 4 { Mode::from_str(parts[3]) } else { Mode::PressRelease },
             }),
             "DELAY" if parts.len() >= 2 => Some(EventKind::Delay(parts[1].to_string())),
             "TYPE"  if parts.len() >= 2 => Some(EventKind::Type(parts[1].to_string())),
             "LOOP_START" if parts.len() >= 2 =>
-            Some(EventKind::LoopStart(parts[1].parse().unwrap_or(0))),
+                Some(EventKind::LoopStart(parts[1].parse().unwrap_or(0))),
             "LOOP_END" => Some(EventKind::LoopEnd),
             _ => None,
         }
@@ -196,10 +215,10 @@ impl Project {
         }
 
         #[cfg(unix)] {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&self.output_file)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&self.output_file, perms)?;
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&self.output_file)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&self.output_file, perms)?;
         }
         Ok(self.output_file.clone())
     }
@@ -267,27 +286,27 @@ fn pick_key_code(terminal: &mut Term, codes_path: &Path) -> Result<Option<String
 
     loop {
         let filtered: Vec<&String> = lines.iter()
-        .filter(|l| l.to_lowercase().contains(&query.to_lowercase()))
-        .collect();
+            .filter(|l| l.to_lowercase().contains(&query.to_lowercase()))
+            .collect();
         let sel = list_state.selected().unwrap_or(0).min(filtered.len().saturating_sub(1));
         list_state.select(Some(sel));
 
         terminal.draw(|f| {
             let area = f.size();
             let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(0)])
-            .split(area);
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(0)])
+                .split(area);
             let search = Paragraph::new(format!(" {}_", query))
-            .block(Block::default().borders(Borders::ALL)
-            .title(" Search key code (ESC=cancel, Enter=select) ")
-            .border_style(Style::default().fg(Color::Yellow)));
+                .block(Block::default().borders(Borders::ALL)
+                    .title(" Search key code (ESC=cancel, Enter=select) ")
+                    .border_style(Style::default().fg(Color::Yellow)));
             f.render_widget(search, chunks[0]);
             let items: Vec<ListItem> = filtered.iter().map(|l| ListItem::new(l.as_str())).collect();
             let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(" Key codes "))
-            .highlight_style(Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD))
-            .highlight_symbol("▶ ");
+                .block(Block::default().borders(Borders::ALL).title(" Key codes "))
+                .highlight_style(Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD))
+                .highlight_symbol("▶ ");
             f.render_stateful_widget(list, chunks[1], &mut list_state);
         })?;
 
@@ -316,11 +335,11 @@ fn pick_from_list(terminal: &mut Term, title: &str, options: &[&str]) -> Result<
             let area = centered_rect(40, options.len() as u16 + 4, f.size());
             let items: Vec<ListItem> = options.iter().map(|o| ListItem::new(*o)).collect();
             let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL)
-            .title(format!(" {} (ESC=cancel) ", title))
-            .border_style(Style::default().fg(Color::Yellow)))
-            .highlight_style(Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD))
-            .highlight_symbol("▶ ");
+                .block(Block::default().borders(Borders::ALL)
+                    .title(format!(" {} (ESC=cancel) ", title))
+                    .border_style(Style::default().fg(Color::Yellow)))
+                .highlight_style(Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD))
+                .highlight_symbol("▶ ");
             f.render_stateful_widget(list, area, &mut list_state);
         })?;
 
@@ -338,40 +357,40 @@ fn pick_from_list(terminal: &mut Term, title: &str, options: &[&str]) -> Result<
 
 fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
     let vert = Layout::default()
-    .direction(Direction::Vertical)
-    .constraints([
-        Constraint::Percentage((100u16.saturating_sub(height.min(100))) / 2),
-                 Constraint::Length(height),
-                 Constraint::Min(0),
-    ])
-    .split(area);
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100u16.saturating_sub(height.min(100))) / 2),
+            Constraint::Length(height),
+            Constraint::Min(0),
+        ])
+        .split(area);
     Layout::default()
-    .direction(Direction::Horizontal)
-    .constraints([
-        Constraint::Percentage((100 - percent_x) / 2),
-                 Constraint::Percentage(percent_x),
-                 Constraint::Percentage((100 - percent_x) / 2),
-    ])
-    .split(vert[1])[1]
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vert[1])[1]
 }
 
 // ─── App state ────────────────────────────────────────────────────────────────
 
 const MENU: &[&str] = &[
     "Add key",
-"Add delay",
-"Add type",
-"Add loop block",
-"Move up",
-"Move down",
-"Edit event",
-"Delete event",
-"Set auto delay",
-"Set global loop",
-"Save",
-"Load",
-"Generate",
-"Quit",
+    "Add delay",
+    "Add type",
+    "Add loop block",
+    "Move up",
+    "Move down",
+    "Edit event",
+    "Delete event",
+    "Set auto delay",
+    "Set global loop",
+    "Save",
+    "Load",
+    "Generate",
+    "Quit",
 ];
 
 #[derive(PartialEq)]
@@ -470,8 +489,8 @@ impl App {
     /// if anything is multi-selected, use those; otherwise use the cursor.
     fn effective_selection(&self) -> Vec<usize> {
         let multi: Vec<usize> = self.selected.iter().enumerate()
-        .filter_map(|(i, &s)| if s { Some(i) } else { None })
-        .collect();
+            .filter_map(|(i, &s)| if s { Some(i) } else { None })
+            .collect();
         if !multi.is_empty() {
             multi
         } else if let Some(c) = self.cursor() {
@@ -496,14 +515,14 @@ impl App {
 
 fn draw(f: &mut Frame, app: &mut App) {
     let root = Layout::default()
-    .direction(Direction::Vertical)
-    .constraints([Constraint::Min(0), Constraint::Length(1)])
-    .split(f.size());
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(f.size());
 
     let body = Layout::default()
-    .direction(Direction::Horizontal)
-    .constraints([Constraint::Length(22), Constraint::Percentage(35), Constraint::Min(0)])
-    .split(root[0]);
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(22), Constraint::Percentage(35), Constraint::Min(0)])
+        .split(root[0]);
 
     draw_menu(f, app, body[0]);
     draw_events(f, app, body[1]);
@@ -516,11 +535,11 @@ fn draw_menu(f: &mut Frame, app: &mut App, area: Rect) {
     let border_style = if focused { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
     let items: Vec<ListItem> = MENU.iter().map(|m| ListItem::new(*m)).collect();
     let list = List::new(items)
-    .block(Block::default().borders(Borders::ALL)
-    .title(Span::styled(" Menu ", Style::default().add_modifier(Modifier::BOLD)))
-    .border_style(border_style))
-    .highlight_style(Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD))
-    .highlight_symbol("▶ ");
+        .block(Block::default().borders(Borders::ALL)
+            .title(Span::styled(" Menu ", Style::default().add_modifier(Modifier::BOLD)))
+            .border_style(border_style))
+        .highlight_style(Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▶ ");
     f.render_stateful_widget(list, area, &mut app.menu_state);
 }
 
@@ -536,38 +555,39 @@ fn draw_events(f: &mut Frame, app: &mut App, area: Rect) {
     let gutter_w = preview_total.to_string().len().max(1);
 
     let items: Vec<ListItem> = app.project.events.iter().enumerate()
-    .map(|(i, ev)| {
-        let is_sel = app.selected.get(i).copied().unwrap_or(false);
-        let depth  = depths.get(i).copied().unwrap_or(0);
-        let indent = "  ".repeat(depth);
-        let lineno = line_nos.get(i).copied().unwrap_or(i + 1);
+        .map(|(i, ev)| {
+            let is_sel = app.selected.get(i).copied().unwrap_or(false);
+            let depth  = depths.get(i).copied().unwrap_or(0);
+            let indent = "  ".repeat(depth);
+            let lineno = line_nos.get(i).copied().unwrap_or(i + 1);
 
-        let (icon, color) = match ev {
-            EventKind::Key { .. }   => ("⌨ ", Color::Green),
-         EventKind::Delay(_)     => ("⏱ ", Color::Magenta),
-         EventKind::Type(_)      => ("T ", Color::Cyan),
-         EventKind::LoopStart(_) => ("↩ ", Color::Yellow),
-         EventKind::LoopEnd      => ("↪ ", Color::Yellow),
-        };
+            let (icon, color) = match ev {
+                EventKind::Key { .. }   => ("⌨ ", Color::Green),
+                EventKind::Click { .. } => ("🖱 ", Color::LightRed),
+                EventKind::Delay(_)     => ("⏱ ", Color::Magenta),
+                EventKind::Type(_)      => ("T ", Color::Cyan),
+                EventKind::LoopStart(_) => ("↩ ", Color::Yellow),
+                EventKind::LoopEnd      => ("↪ ", Color::Yellow),
+            };
 
-        let sel_marker = if is_sel {
-            Span::styled("● ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
-        } else {
-            Span::styled("  ", Style::default())
-        };
+            let sel_marker = if is_sel {
+                Span::styled("● ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled("  ", Style::default())
+            };
 
-        ListItem::new(Line::from(vec![
-            sel_marker,
-            Span::styled(
-                format!("{:>width$} ", lineno, width = gutter_w),
+            ListItem::new(Line::from(vec![
+                sel_marker,
+                Span::styled(
+                    format!("{:>width$} ", lineno, width = gutter_w),
                     Style::default().fg(Color::DarkGray),
-            ),
-            Span::raw(indent),
-                                 Span::styled(icon, Style::default().fg(color)),
-                                 Span::raw(ev.display()),
-        ]))
-    })
-    .collect();
+                ),
+                Span::raw(indent),
+                Span::styled(icon, Style::default().fg(color)),
+                Span::raw(ev.display()),
+            ]))
+        })
+        .collect();
 
     let multi_count = app.selected.iter().filter(|&&s| s).count();
     let title = if multi_count > 0 {
@@ -577,11 +597,11 @@ fn draw_events(f: &mut Frame, app: &mut App, area: Rect) {
     };
 
     let list = List::new(items)
-    .block(Block::default().borders(Borders::ALL)
-    .title(Span::styled(title, Style::default().add_modifier(Modifier::BOLD)))
-    .border_style(border_style))
-    .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD))
-    .highlight_symbol("▶ ");
+        .block(Block::default().borders(Borders::ALL)
+            .title(Span::styled(title, Style::default().add_modifier(Modifier::BOLD)))
+            .border_style(border_style))
+        .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▶ ");
     f.render_stateful_widget(list, area, &mut app.event_state);
 }
 
@@ -607,7 +627,7 @@ fn draw_bash_preview(f: &mut Frame, app: &mut App, area: Rect) {
     let lines: Vec<Line> = raw_lines.iter().enumerate().map(|(ln, line)| {
         let line_num = Span::styled(
             format!("{:>width$} ", ln + 1, width = gutter_w),
-                gutter_style,
+            gutter_style,
         );
         let trimmed = line.trim_start();
         let leading = &line[..line.len() - trimmed.len()];
@@ -615,27 +635,48 @@ fn draw_bash_preview(f: &mut Frame, app: &mut App, area: Rect) {
 
         if trimmed.starts_with('#') {
             spans.push(Span::styled(line.to_string(), Style::default().fg(Color::DarkGray)));
+        } else if trimmed.starts_with("ydotool click") {
+            // legacy click lines (shouldn't appear in new scripts, kept for old saves)
+            let rest = &trimmed["ydotool click ".len()..];
+            let (code, comment) = rest.split_once(" #").unwrap_or((rest, ""));
+            spans.extend([
+                Span::raw(leading.to_string()),
+                Span::styled("ydotool ".to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled("key ".to_string(), Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)),
+                Span::styled(code.to_string(), Style::default().fg(Color::White)),
+            ]);
+            if !comment.is_empty() {
+                spans.push(Span::styled(format!(" #{}", comment), Style::default().fg(Color::DarkGray)));
+            }
         } else if trimmed.starts_with("ydotool type") {
             let rest = trimmed["ydotool type".len()..].to_string();
             spans.extend([
                 Span::raw(leading.to_string()),
-                         Span::styled("ydotool ".to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                         Span::styled("type ".to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                         Span::styled(rest, Style::default().fg(Color::White)),
+                Span::styled("ydotool ".to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled("type ".to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(rest, Style::default().fg(Color::White)),
             ]);
         } else if trimmed.starts_with("ydotool") {
+            // Mouse button events (BTN_ codes) get light red to distinguish from keyboard keys
+            let is_mouse = trimmed.contains("#BTN_");
+            let key_color = if is_mouse { Color::LightRed } else { Color::Green };
             let (cmd, rest) = trimmed.split_once(' ').unwrap_or((trimmed, ""));
+            // Split args from trailing comment for separate styling
+            let (args, comment) = rest.split_once(" #").unwrap_or((rest, ""));
             spans.extend([
                 Span::raw(leading.to_string()),
-                         Span::styled(format!("{} ", cmd), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                         Span::styled(rest.to_string(), Style::default().fg(Color::Green)),
+                Span::styled(format!("{} ", cmd), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(args.to_string(), Style::default().fg(key_color)),
             ]);
+            if !comment.is_empty() {
+                spans.push(Span::styled(format!(" #{}", comment), Style::default().fg(Color::DarkGray)));
+            }
         } else if trimmed.starts_with("sleep") {
             let (cmd, rest) = trimmed.split_once(' ').unwrap_or((trimmed, ""));
             spans.extend([
                 Span::raw(leading.to_string()),
-                         Span::styled(format!("{} ", cmd), Style::default().fg(Color::Magenta)),
-                         Span::styled(rest.to_string(), Style::default().fg(Color::White)),
+                Span::styled(format!("{} ", cmd), Style::default().fg(Color::Magenta)),
+                Span::styled(rest.to_string(), Style::default().fg(Color::White)),
             ]);
         } else if trimmed.starts_with("for ") || trimmed.starts_with("while ") || trimmed == "done" {
             spans.push(Span::styled(line.to_string(), Style::default().fg(Color::Yellow)));
@@ -649,13 +690,13 @@ fn draw_bash_preview(f: &mut Frame, app: &mut App, area: Rect) {
     }).collect();
 
     let para = Paragraph::new(lines)
-    .block(Block::default().borders(Borders::ALL)
-    .title(Span::styled(
-        format!(" Bash Preview → {} ", app.project.output_file.display()),
-            Style::default().add_modifier(Modifier::BOLD),
-    ))
-    .border_style(Style::default().fg(Color::DarkGray)))
-    .scroll((app.preview_scroll, 0));
+        .block(Block::default().borders(Borders::ALL)
+            .title(Span::styled(
+                format!(" Bash Preview → {} ", app.project.output_file.display()),
+                Style::default().add_modifier(Modifier::BOLD),
+            ))
+            .border_style(Style::default().fg(Color::DarkGray)))
+        .scroll((app.preview_scroll, 0));
     f.render_widget(para, area);
 }
 
@@ -664,7 +705,7 @@ fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
         InputMode::Prompting { label, buffer, .. } => {
             let text = format!(" {} {}_", label, buffer);
             let para = Paragraph::new(text)
-            .style(Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD));
+                .style(Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD));
             f.render_widget(para, area);
         }
         InputMode::Normal => {
@@ -682,7 +723,7 @@ fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
                 app.project.name, app.project.auto_delay, global, help, app.status,
             );
             let para = Paragraph::new(text)
-            .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+                .style(Style::default().bg(Color::DarkGray).fg(Color::White));
             f.render_widget(para, area);
         }
     }
@@ -778,7 +819,7 @@ fn confirm_prompt(app: &mut App) {
                 app.clamp_cursor();
                 app.status = format!(
                     "Loop block added ({}). Add events between LOOP and END LOOP.",
-                                     if count == 0 { "∞".to_string() } else { format!("{}x", count) }
+                    if count == 0 { "∞".to_string() } else { format!("{}x", count) }
                 );
             }
         }
@@ -795,11 +836,11 @@ fn action_add_key(terminal: &mut Term, app: &mut App) -> Result<()> {
     let candidates = [
         PathBuf::from("input-event-codes_edited"),
         std::env::current_exe().unwrap_or_default()
-        .parent().unwrap_or(Path::new("."))
-        .join("input-event-codes_edited"),
+            .parent().unwrap_or(Path::new("."))
+            .join("input-event-codes_edited"),
     ];
     let codes_path = candidates.iter().find(|p| p.exists()).cloned()
-    .context("input-event-codes_edited not found next to binary or in cwd")?;
+        .context("input-event-codes_edited not found next to binary or in cwd")?;
 
     let sel = match pick_key_code(terminal, &codes_path)? { Some(s) => s, None => return Ok(()) };
     let (code, name) = if let Some(pos) = sel.find(':') {
@@ -807,10 +848,21 @@ fn action_add_key(terminal: &mut Term, app: &mut App) -> Result<()> {
     } else {
         (sel.trim().to_string(), sel.trim().to_string())
     };
+
     let mode_str = match pick_from_list(terminal, "Key mode", Mode::all())? { Some(s) => s, None => return Ok(()) };
-    app.project.events.push(EventKind::Key { code, name, mode: Mode::from_str(&mode_str) });
-    app.clamp_cursor();
-    app.status = "Key added.".to_string();
+    let mode = Mode::from_str(&mode_str);
+
+    // BTN_ codes are stored as Click so the UI shows the mouse icon and
+    // light-red colour, but the output is identical ydotool key syntax.
+    if name.starts_with("BTN_") {
+        app.project.events.push(EventKind::Click { code, name: name.clone(), mode });
+        app.clamp_cursor();
+        app.status = format!("Mouse button {} added ({}).", name, mode_str);
+    } else {
+        app.project.events.push(EventKind::Key { code, name, mode });
+        app.clamp_cursor();
+        app.status = "Key added.".to_string();
+    }
     Ok(())
 }
 
@@ -829,6 +881,15 @@ fn action_edit(terminal: &mut Term, app: &mut App) -> Result<()> {
                 app.project.save()?;
             }
         }
+        EventKind::Click { .. } => {
+            if let Some(mode_str) = pick_from_list(terminal, "New mode", Mode::all())? {
+                if let EventKind::Click { mode, .. } = &mut app.project.events[idx] {
+                    *mode = Mode::from_str(&mode_str);
+                }
+                app.status = "Mouse button mode updated.".to_string();
+                app.project.save()?;
+            }
+        }
         EventKind::Delay(d) => {
             let current = d.clone();
             app.start_prompt(&format!("Edit delay [{}s] → ", current), PromptTarget::EditDelay(idx));
@@ -841,7 +902,7 @@ fn action_edit(terminal: &mut Term, app: &mut App) -> Result<()> {
             let current = *n;
             app.start_prompt(
                 &format!("Loop count (0=∞) [{}] → ", current),
-                             PromptTarget::EditLoopCount(idx),
+                PromptTarget::EditLoopCount(idx),
             );
         }
         EventKind::LoopEnd => {
@@ -855,8 +916,8 @@ fn action_delete(app: &mut App) {
     // Delete all multi-selected, or cursor if none selected
     let to_delete: Vec<usize> = {
         let multi: Vec<usize> = app.selected.iter().enumerate()
-        .filter_map(|(i, &s)| if s { Some(i) } else { None })
-        .collect();
+            .filter_map(|(i, &s)| if s { Some(i) } else { None })
+            .collect();
         if !multi.is_empty() { multi }
         else if let Some(c) = app.cursor() { vec![c] }
         else { return; }
@@ -877,23 +938,244 @@ fn action_generate(app: &mut App) -> Result<()> {
     Ok(())
 }
 
+// ─── Startup screen ──────────────────────────────────────────────────────────
+
+/// Full-TUI startup: pick New / Load, return a ready Project or None to quit.
+fn startup_screen(terminal: &mut Term) -> Result<Option<Project>> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum StartupState { Menu, NamingNew, BrowsingFiles }
+
+    let menu_items = ["New script", "Load existing .ydotooler", "Quit"];
+    let mut menu_state = ListState::default();
+    menu_state.select(Some(0));
+
+    let mut state   = StartupState::Menu;
+    let mut name_buf = String::new();
+    let mut err_msg  = String::new();
+
+    // For file browser
+    let mut file_query = String::new();
+    let mut file_state = ListState::default();
+
+    loop {
+        // Collect .ydotooler files fresh each frame (cheap, allows external creation)
+        let ydotooler_files: Vec<String> = std::fs::read_dir(".")
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.ends_with(".ydotooler") { Some(name) } else { None }
+            })
+            .collect();
+
+        let filtered_files: Vec<&String> = ydotooler_files.iter()
+            .filter(|f| f.to_lowercase().contains(&file_query.to_lowercase()))
+            .collect();
+
+        terminal.draw(|f| {
+            let area = f.size();
+
+            // ── Centred card ─────────────────────────────────────────────────
+            let card = centered_rect(50, 18, area);
+
+            // Background block with title
+            let outer = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(Span::styled(
+                    " ydotooler ",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ));
+            f.render_widget(outer, card);
+
+            let inner = Layout::default()
+                .direction(Direction::Vertical)
+                .margin(1)
+                .constraints([
+                    Constraint::Length(1), // subtitle
+                    Constraint::Length(1), // spacer
+                    Constraint::Min(0),    // content
+                    Constraint::Length(1), // error / hint
+                ])
+                .split(card);
+
+            let subtitle = Paragraph::new("ydotool script editor")
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Center);
+            f.render_widget(subtitle, inner[0]);
+
+            match state {
+                StartupState::Menu => {
+                    let items: Vec<ListItem> = menu_items.iter()
+                        .map(|m| ListItem::new(*m))
+                        .collect();
+                    let list = List::new(items)
+                        .block(Block::default().borders(Borders::ALL)
+                            .title(" What would you like to do? ")
+                            .border_style(Style::default().fg(Color::Cyan)))
+                        .highlight_style(Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD))
+                        .highlight_symbol("▶ ");
+                    f.render_stateful_widget(list, inner[2], &mut menu_state);
+
+                    let hint = Paragraph::new("↑↓ navigate   Enter select   Ctrl-C quit")
+                        .style(Style::default().fg(Color::DarkGray))
+                        .alignment(Alignment::Center);
+                    f.render_widget(hint, inner[3]);
+                }
+
+                StartupState::NamingNew => {
+                    let display = format!(" {}_", name_buf);
+                    let input = Paragraph::new(display)
+                        .block(Block::default().borders(Borders::ALL)
+                            .title(" New project name (Enter to confirm, ESC to go back) ")
+                            .border_style(Style::default().fg(Color::Green)));
+                    f.render_widget(input, inner[2]);
+
+                    let hint_text = if err_msg.is_empty() {
+                        "A .ydotooler file will be created in the current directory.".to_string()
+                    } else {
+                        err_msg.clone()
+                    };
+                    let hint = Paragraph::new(hint_text)
+                        .style(Style::default().fg(if err_msg.is_empty() { Color::DarkGray } else { Color::Red }))
+                        .alignment(Alignment::Center);
+                    f.render_widget(hint, inner[3]);
+                }
+
+                StartupState::BrowsingFiles => {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Length(3), Constraint::Min(0)])
+                        .split(inner[2]);
+
+                    let search = Paragraph::new(format!(" {}_", file_query))
+                        .block(Block::default().borders(Borders::ALL)
+                            .title(" Search (ESC to go back) ")
+                            .border_style(Style::default().fg(Color::Cyan)));
+                    f.render_widget(search, chunks[0]);
+
+                    let items: Vec<ListItem> = if filtered_files.is_empty() {
+                        vec![ListItem::new(Span::styled(
+                            "  No .ydotooler files found in current directory.",
+                            Style::default().fg(Color::DarkGray),
+                        ))]
+                    } else {
+                        filtered_files.iter()
+                            .map(|f| ListItem::new(f.as_str()))
+                            .collect()
+                    };
+                    let list = List::new(items)
+                        .block(Block::default().borders(Borders::ALL).title(" .ydotooler files "))
+                        .highlight_style(Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD))
+                        .highlight_symbol("▶ ");
+                    f.render_stateful_widget(list, chunks[1], &mut file_state);
+
+                    let hint = Paragraph::new("↑↓ navigate   Enter load   ESC back")
+                        .style(Style::default().fg(Color::DarkGray))
+                        .alignment(Alignment::Center);
+                    f.render_widget(hint, inner[3]);
+                }
+            }
+        })?;
+
+        if let Event::Key(key) = event::read()? {
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                return Ok(None);
+            }
+
+            match state {
+                // ── Main menu ────────────────────────────────────────────────
+                StartupState::Menu => match key.code {
+                    KeyCode::Up => {
+                        let cur = menu_state.selected().unwrap_or(0);
+                        menu_state.select(Some(cur.saturating_sub(1)));
+                    }
+                    KeyCode::Down => {
+                        let cur = menu_state.selected().unwrap_or(0);
+                        menu_state.select(Some((cur + 1).min(menu_items.len() - 1)));
+                    }
+                    KeyCode::Enter => match menu_state.selected().unwrap_or(0) {
+                        0 => { // New
+                            name_buf.clear();
+                            err_msg.clear();
+                            state = StartupState::NamingNew;
+                        }
+                        1 => { // Load
+                            file_query.clear();
+                            file_state.select(Some(0));
+                            state = StartupState::BrowsingFiles;
+                        }
+                        _ => return Ok(None), // Quit
+                    },
+                    KeyCode::Char('q') => return Ok(None),
+                    _ => {}
+                },
+
+                // ── New project name prompt ───────────────────────────────────
+                StartupState::NamingNew => match key.code {
+                    KeyCode::Esc => {
+                        state = StartupState::Menu;
+                        err_msg.clear();
+                    }
+                    KeyCode::Char(c) => { name_buf.push(c); err_msg.clear(); }
+                    KeyCode::Backspace => { name_buf.pop(); err_msg.clear(); }
+                    KeyCode::Enter => {
+                        let name = name_buf.trim().to_string();
+                        if name.is_empty() {
+                            err_msg = "Name cannot be empty.".to_string();
+                        } else {
+                            let mut project = Project::new(&name);
+                            project.load()?;
+                            return Ok(Some(project));
+                        }
+                    }
+                    _ => {}
+                },
+
+                // ── File browser ─────────────────────────────────────────────
+                StartupState::BrowsingFiles => {
+                    let n_files = filtered_files.len();
+                    let cur = file_state.selected().unwrap_or(0);
+                    match key.code {
+                        KeyCode::Esc => { state = StartupState::Menu; }
+                        KeyCode::Char(c) => { file_query.push(c); file_state.select(Some(0)); }
+                        KeyCode::Backspace => { file_query.pop(); file_state.select(Some(0)); }
+                        KeyCode::Up   => { file_state.select(Some(cur.saturating_sub(1))); }
+                        KeyCode::Down => { if n_files > 0 { file_state.select(Some((cur + 1).min(n_files - 1))); } }
+                        KeyCode::Enter => {
+                            if let Some(chosen) = filtered_files.get(cur) {
+                                let mut project = Project::new(chosen);
+                                project.load()?;
+                                return Ok(Some(project));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ─── Main loop ────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
-    print!("Project name: ");
-    io::stdout().flush()?;
-    let mut name_buf = String::new();
-    io::stdin().read_line(&mut name_buf)?;
-    let name = name_buf.trim().to_string();
-    if name.is_empty() { bail!("No project name given."); }
-
-    let mut project = Project::new(&name);
-    project.load()?;
-
     enable_raw_mode()?;
     execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+
+    let project = match startup_screen(&mut terminal)? {
+        Some(p) => p,
+        None => {
+            disable_raw_mode()?;
+            execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+            terminal.show_cursor()?;
+            return Ok(());
+        }
+    };
     terminal.clear()?;
 
     let mut app = App::new(project);
