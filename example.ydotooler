@@ -1,0 +1,16 @@
+#AUTO_DELAY=0
+#GLOBAL_LOOP=0
+KEY|29|KEY_LEFTCTRL|press only
+KEY|56|KEY_LEFTALT|press only
+KEY|20|KEY_T|press+release
+KEY|29|KEY_LEFTCTRL|release only
+KEY|56|KEY_LEFTALT|release only
+DELAY|0.5||
+TYPE|vim||
+KEY|28|KEY_ENTER|press+release
+DELAY|0.3||
+KEY|23|KEY_I|press+release
+DELAY|0.3||
+TYPE|Hello world!||
+KEY|28|KEY_ENTER|press+release
+KEY|1|KEY_ESC|press+release
