@@ -481,6 +481,39 @@ impl App {
         self.sync_preview_scroll();
     }
 
+    /// Insert an event immediately after the cursor, or at the end if no
+    /// cursor. Leaves the cursor on the newly inserted event.
+    fn insert_after_cursor(&mut self, ev: EventKind) {
+        let insert_pos = match self.event_state.selected() {
+            Some(cur) => cur + 1,
+            None      => self.project.events.len(),
+        };
+        self.project.events.insert(insert_pos, ev);
+        self.sync_selected_len();
+        self.event_state.select(Some(insert_pos));
+        self.sync_preview_scroll();
+    }
+
+    /// Duplicate all multi-selected events (or the cursor event), inserting
+    /// the copies immediately after the last selected index.
+    fn duplicate_selection(&mut self) {
+        let indices = self.effective_selection();
+        if indices.is_empty() { return; }
+        let copies: Vec<EventKind> = indices.iter()
+            .map(|&i| self.project.events[i].clone())
+            .collect();
+        let insert_at = *indices.last().unwrap() + 1;
+        for (offset, ev) in copies.into_iter().enumerate() {
+            self.project.events.insert(insert_at + offset, ev);
+        }
+        // Move cursor to last inserted copy
+        let new_cursor = insert_at + indices.len() - 1;
+        self.clear_selection();
+        self.sync_selected_len();
+        self.event_state.select(Some(new_cursor));
+        self.sync_preview_scroll();
+    }
+
     fn clear_selection(&mut self) {
         self.selected.iter_mut().for_each(|s| *s = false);
     }
@@ -711,7 +744,7 @@ fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
         InputMode::Normal => {
             let help = match app.focus {
                 Focus::Menu   => "↑↓ navigate  Enter select  Tab→Events  q quit",
-                Focus::Events => "↑↓ navigate  Space=toggle-sel  k/K up  j/J down  d delete  Tab→Menu",
+                Focus::Events => "↑↓ navigate  Space=toggle-sel  k/K up  j/J down  u dup  d delete  Tab→Menu",
             };
             let global = if app.project.global_loop > 0 {
                 format!("global_loop={}x", app.project.global_loop)
@@ -760,16 +793,14 @@ fn confirm_prompt(app: &mut App) {
         match target {
             PromptTarget::AddDelay => {
                 if !val.is_empty() {
-                    app.project.events.push(EventKind::Delay(val.clone()));
-                    app.clamp_cursor();
+                    app.insert_after_cursor(EventKind::Delay(val.clone()));
                     app.status = format!("Delay {}s added.", val);
                 }
             }
             PromptTarget::AddType => {
                 if !val.is_empty() {
-                    app.project.events.push(EventKind::Type(val.clone()));
-                    app.clamp_cursor();
-                    app.status = format!("Type event added.");
+                    app.insert_after_cursor(EventKind::Type(val.clone()));
+                    app.status = "Type event added.".to_string();
                 }
             }
             PromptTarget::EditDelay(idx) => {
@@ -814,9 +845,8 @@ fn confirm_prompt(app: &mut App) {
             }
             PromptTarget::AddLoopBlock => {
                 let count = val.parse::<u32>().unwrap_or(0);
-                app.project.events.push(EventKind::LoopStart(count));
-                app.project.events.push(EventKind::LoopEnd);
-                app.clamp_cursor();
+                app.insert_after_cursor(EventKind::LoopStart(count));
+                app.insert_after_cursor(EventKind::LoopEnd);
                 app.status = format!(
                     "Loop block added ({}). Add events between LOOP and END LOOP.",
                     if count == 0 { "∞".to_string() } else { format!("{}x", count) }
@@ -855,12 +885,10 @@ fn action_add_key(terminal: &mut Term, app: &mut App) -> Result<()> {
     // BTN_ codes are stored as Click so the UI shows the mouse icon and
     // light-red colour, but the output is identical ydotool key syntax.
     if name.starts_with("BTN_") {
-        app.project.events.push(EventKind::Click { code, name: name.clone(), mode });
-        app.clamp_cursor();
+        app.insert_after_cursor(EventKind::Click { code, name: name.clone(), mode });
         app.status = format!("Mouse button {} added ({}).", name, mode_str);
     } else {
-        app.project.events.push(EventKind::Key { code, name, mode });
-        app.clamp_cursor();
+        app.insert_after_cursor(EventKind::Key { code, name, mode });
         app.status = "Key added.".to_string();
     }
     Ok(())
@@ -1320,6 +1348,11 @@ fn handle_event_pane_key(app: &mut App, code: KeyCode) {
         // Escape = clear multi-selection
         KeyCode::Esc => { app.clear_selection(); app.status = "Selection cleared.".to_string(); }
 
+        KeyCode::Char('u') => {
+            app.duplicate_selection();
+            let _ = app.project.save();
+            app.status = "Duplicated.".to_string();
+        }
         KeyCode::Char('d') => {
             action_delete(app);
             let _ = app.project.save();
